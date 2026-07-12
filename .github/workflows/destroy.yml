@@ -1,0 +1,78 @@
+name: destroy
+
+# Manual teardown. Requires typing "destroy" to confirm — this is the
+# only workflow that removes infrastructure, and it never runs on push.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to tear down all infrastructure'
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: terraform-state
+  cancel-in-progress: false
+
+env:
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: "true"
+  TF_IN_AUTOMATION: "true"
+  STATE_RG: kolaform-tfstate-rg
+
+jobs:
+  destroy:
+    if: github.event.inputs.confirm == 'destroy'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Derive state backend name
+        id: backend
+        run: |
+          SUFFIX=$(echo -n "$ARM_SUBSCRIPTION_ID" | sha256sum | cut -c1-10)
+          echo "sa=tfstate$SUFFIX" >> "$GITHUB_OUTPUT"
+
+      - name: Open storage firewall for runner
+        run: |
+          DATA_SA=$(az storage account list \
+            --query "[?tags.project=='kolaform' && tags.role=='data'].name | [0]" -o tsv)
+          if [ -n "$DATA_SA" ] && [ "$DATA_SA" != "None" ]; then
+            RUNNER_IP=$(curl -fsS https://api.ipify.org)
+            az storage account network-rule add \
+              --account-name "$DATA_SA" --ip-address "$RUNNER_IP" --output none
+            sleep 30
+          fi
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=$STATE_RG" \
+            -backend-config="storage_account_name=${{ steps.backend.outputs.sa }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=kolaform.tfstate" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform destroy
+        run: terraform destroy -input=false -auto-approve
